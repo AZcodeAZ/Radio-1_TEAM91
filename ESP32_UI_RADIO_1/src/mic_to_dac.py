@@ -7,8 +7,8 @@ import numpy as np
 import serial
 import sounddevice as sd
 
-SAMPLE_RATE = 8000
-BLOCK_SIZE = 160
+SAMPLE_RATE = 48000
+BLOCK_SIZE = 960
 SYNC = b"\xAA\x55"
 
 audio_queue = queue.Queue(maxsize=40)
