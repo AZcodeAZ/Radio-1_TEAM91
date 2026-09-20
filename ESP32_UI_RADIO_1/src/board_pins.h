@@ -1,17 +1,19 @@
 #pragma once
 #include <Arduino.h>
 
-// Shared SPI bus: Pmod DA4 + MCP3208
-static constexpr gpio_num_t PIN_SPI_SCK  = GPIO_NUM_12;
-static constexpr gpio_num_t PIN_SPI_MOSI = GPIO_NUM_11;
-static constexpr gpio_num_t PIN_SPI_MISO = GPIO_NUM_13;
+//CD4051BE Mulitplexers
+constexpr uint8_t PIN_MUX_A = 4;
+constexpr uint8_t PIN_MUX_B = 5;
+constexpr uint8_t PIN_MUX_C = 6;
+constexpr uint8_t PIN_MUX_INH = 7;
 
-static constexpr gpio_num_t PIN_DA4_CS      = GPIO_NUM_10;
-static constexpr gpio_num_t PIN_MCP3208_CS  = GPIO_NUM_9;
+//SPI Bus (Shared: Pmod DA4, MCP3208)
+constexpr uint8_t PIN_SPI_SCK = 12;
+constexpr uint8_t PIN_SPI_MOSI = 11;
+constexpr uint8_t PIN_SPI_MISO = 13;
+constexpr uint8_t PIN_CS_DAC = 9;
+constexpr uint8_t PIN_CS_ADC = 10;
 
-// RF controls. Do not connect these to the RF PCB until you verify
-// your schematic's mapping of J1/J2/J3
-static constexpr gpio_num_t PIN_SWITCH_V1   = GPIO_NUM_7;
-static constexpr gpio_num_t PIN_SWITCH_V2   = GPIO_NUM_6;
-
-static constexpr gpio_num_t PIN_RGB_LED = GPIO_NUM_38;
+//I2C Bus (PCF8574P)
+constexpr uint8_t PIN_I2C_SDA = 1;
+constexpr uint8_t PIN_I2C_SDA = 2;
