@@ -1,299 +1,330 @@
 #include <Arduino.h>
-#include <math.h>
-
+#include <SPI.h>
 #include "board_pins.h"
+#include "mux_logic.h"
 #include "dac_control.h"
 #include "adc_control.h"
 
+// Hardware SPI Buses
+#if CONFIG_IDF_TARGET_ESP32H2
+SPIClass spiADC(FSPI); // ESP32-H2 only has FSPI (no HSPI peripheral)
+SPIClass spiDAC(FSPI); // Satisfies extern SPIClass spiDAC in dac_control.cpp
+constexpr int SWITCH_PIN = PIN_RF_SWITCH;
+constexpr uint8_t ONBOARD_LED_PIN = 8;  // ESP32-H2 onboard WS2812 RGB LED
+#else
+SPIClass spiADC(FSPI); // S3 Hardware SPI2
+SPIClass spiDAC(HSPI); // S3 Hardware SPI3
+constexpr int SWITCH_PIN = PIN_RF_SWITCH;
+constexpr uint8_t ONBOARD_LED_PIN = 38; // ESP32-S3 onboard WS2812 RGB LED
+#endif
 
-// Threshold setup for a 0 - 3.3V signal (midpoint ~ 2048 count / 1.65V)
-constexpr uint16_t THRESHOLD_HIGH = 2100; // Upper hysteresis limit
-constexpr uint16_t THRESHOLD_LOW  = 1900; // Lower hysteresis limit
+// Audio & Battery Timing
+constexpr unsigned long TX_TIMEOUT_MS = 200;
+unsigned long lastTxDataTime = 0;
 
-bool isHigh = false;
-unsigned long lastCrossingMicros = 0;
-float currentFrequencyHz = 0.0f;
+// Battery State & Debounce
+bool debouncedLowState = false;
+static unsigned long lastBatteryCheckMs = 0;
+static uint8_t lowCounter = 0;
+static uint8_t highCounter = 0;
+constexpr uint8_t STABILITY_THRESHOLD = 5;
 
-// ===============================
-// Waveform settings
-// ===============================
+// Default Filter Routing (RAW RX = CH2, RAW TX = CH1)
+uint8_t rxFilterChannel = 2; // Default: ADC CH2 (RAW_RX)
+uint8_t txFilterChannel = 1; // Default: PCB MUX CH1 (RAW_TX)
+bool isCurrentlyTxMode = false;
 
-constexpr uint16_t TABLE_SIZE = 256;
+// Filter Protocol Command Definitions
+constexpr uint8_t CMD_TARGET_RX = 0xE0;
+constexpr uint8_t CMD_TARGET_TX = 0xF0;
 
-// Select waveform:
-// SINE
-// TRIANGLE
-// SQUARE
+// DAC Sample Packet (PC -> ESP32): 0xAA 0x55 | Count (uint16 LE) | Count x Sample (int16 LE)
+constexpr uint8_t TX_SYNC_0 = 0xAA;
+constexpr uint8_t TX_SYNC_1 = 0x55;
+constexpr uint16_t TX_MAX_PACKET_SAMPLES = 480;       // Matches FIRMWARE_MAX_PACKET_SAMPLES in UI
+constexpr int SERIAL_BYTES_PER_LOOP = 32;             // High throughput to prevent USB buffer overruns
 
-enum WaveformType
-{
-    SINE,
-    TRIANGLE,
-    SQUARE
-};
+// DAC Playback Buffer Settings
+constexpr uint32_t DAC_BUFFER_SIZE = 4096;            // Power of 2 (~85 ms at 48 kHz)
+constexpr uint32_t DAC_PREFILL_SAMPLES = 960;         // ~20 ms cushion before playback starts
+constexpr uint32_t DAC_INTERVAL_MICROS = 125 / 6;     // ~48 kHz (20.83 us per sample)
+uint16_t dacBuffer[DAC_BUFFER_SIZE];
+uint32_t dacHead = 0;                                 // Ring buffer fill = dacHead - dacTail
+uint32_t dacTail = 0;
+bool dacPlaying = false;
+uint32_t lastDacMicros = 0;
 
-constexpr WaveformType WAVEFORM = SQUARE;
+// Serial Parser State
+enum class RxState : uint8_t { Idle, CommandCode, Sync, LengthLo, LengthHi, SampleLo, SampleHi };
+RxState rxState = RxState::Idle;
+uint8_t commandTarget = 0;
+uint16_t samplesRemaining = 0;
+uint8_t sampleLo = 0;
 
-// Actual measured free-running DAC sample rate
-constexpr float SAMPLE_RATE = 100000.0f; // MAY NEED TO CHANGE!!!
+// Unified RX / TX Mode Switching
+void setMode(bool isTx) {
+    isCurrentlyTxMode = isTx;
 
-// Desired output frequency
-constexpr float OUTPUT_FREQUENCY = 20000.0f;
-
-// ===============================
-// Waveform table
-// ===============================
-
-uint16_t waveformTable[TABLE_SIZE];
-
-void generateWaveformTable()
-{
-    for (uint16_t i = 0; i < TABLE_SIZE; i++)
-    {
-        float normalized =
-            (float)i / TABLE_SIZE;
-
-        float voltage;
-
-        switch (WAVEFORM)
-        {
-            // ===============================
-            // Sine wave
-            // ===============================
-
-            case SINE:
-            {
-                // 1.25 V DC offset
-                // 0.5 V peak amplitude = 1 Vpp
-
-                float angle =
-                    2.0f * PI * normalized;
-
-                voltage =
-                    1.25f + 0.5f * sin(angle);
-
-                break;
-            }
-
-            // ===============================
-            // Triangle wave
-            // ===============================
-
-            case TRIANGLE:
-            {
-                float triangle;
-
-                if (normalized < 0.5f)
-                {
-                    triangle =
-                        4.0f * normalized - 1.0f;
-                }
-                else
-                {
-                    triangle =
-                        3.0f - 4.0f * normalized;
-                }
-
-                // Convert -1 to +1
-                // into 0.75 V to 1.75 V
-
-                voltage =
-                    1.25f + 0.5f * triangle;
-
-                break;
-            }
-
-            // ===============================
-            // Square wave
-            // ===============================
-
-            case SQUARE:
-            {
-                // 50% duty cycle
-                //
-                // 0.75 V low
-                // 1.75 V high
-                //
-                // 1 Vpp centered at 1.25 V
-
-                if (normalized < 0.5f)
-                {
-                    voltage = 1.75f;
-                }
-                else
-                {
-                    voltage = 0.75f;
-                }
-
-                break;
-            }
-        }
-
-        waveformTable[i] =
-            (uint16_t)(
-                (voltage / 2.5f) * 4095.0f
-            );
+    if (isCurrentlyTxMode) {
+        digitalWrite(SWITCH_PIN, HIGH);
+        neopixelWrite(ONBOARD_LED_PIN, 15, 5, 0);   // Onboard LED: AMBER (TX Mode)
+        setTxMuxEnable(true);                         // Enable PCB MUX output
+        selectTxFilter(txFilterChannel);              // Apply active TX filter channel
+    } else {
+        digitalWrite(SWITCH_PIN, LOW);
+        neopixelWrite(ONBOARD_LED_PIN, 0, 10, 0);   // Onboard LED: GREEN (RX Mode)
+        setTxMuxEnable(false);                        // Disable PCB MUX output during RX
     }
 }
 
-// ===============================
-// DDS phase accumulator
-// ===============================
+void sendBatteryStatusFrame(uint8_t batteryState) {
+    uint8_t frame[2] = { batteryState, 0xCC };
+    Serial.write(frame, 2);
+}
 
-uint32_t phase = 0;
-uint32_t phaseIncrement;
+// Filter Command Handler
+void handleFilterCommand(uint8_t target, uint8_t code) {
+    if (target == CMD_TARGET_RX) {
+        // RX Filter Selection (MCP3204/3208 ADC Internal MUX)
+        switch (code) {
+            case 0xE1:
+                rxFilterChannel = 0; // CH0 - NOTCH
+                break;
+            case 0xE2:
+                rxFilterChannel = 1; // CH1 - LP1 (5kHz)
+                break;
+            case 0xE3:
+                rxFilterChannel = 2; // CH2 - RAW_RX
+                break;
+            default:
+                break;
+        }
+    } else {
+        // TX Filter Selection (PCB MUX)
+        switch (code) {
+            case 0xF1:
+                txFilterChannel = 0; // CH0 - HP (120 Hz)
+                break;
+            case 0xF2:
+                txFilterChannel = 1; // CH1 - RAW_TX
+                break;
+            case 0xF3:
+                txFilterChannel = 2; // CH2 - LP1 (5kHz)
+                break;
+            default:
+                break;
+        }
 
-// ===============================
-// Setup
-// ===============================
+        if (isCurrentlyTxMode) {
+            selectTxFilter(txFilterChannel);
+        }
+    }
+}
 
-void setup()
-{
-    Serial.begin(115200);
+void resetDacPlayback() {
+    dacHead = 0;
+    dacTail = 0;
+    dacPlaying = false;
+    dacWrite(2048); // Return DAC to mid-scale silence (1.65V)
+}
 
-    delay(1000);
+void pushDacSample(uint16_t sample) {
+    if (dacHead - dacTail < DAC_BUFFER_SIZE) {
+        dacBuffer[dacHead++ & (DAC_BUFFER_SIZE - 1)] = sample;
+    }
+}
 
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("ESP32 MCP3208 ADC GRAPHING TEST");
-    Serial.println("================================");
-
-    // Initialize ADC hardware
-    adcBegin();
-
-
-    // Generate selected waveform
-    /*generateWaveformTable();
-
-    // Calculate DDS phase increment
-
-    phaseIncrement =
-        (uint32_t)(
-            (OUTPUT_FREQUENCY * 4294967296.0)
-            / SAMPLE_RATE
-        );
-
-    // ===============================
-    // Print waveform selection
-    // ===============================
-
-    Serial.print("Waveform: ");
-
-    switch (WAVEFORM)
-    {
-        case SINE:
-            Serial.println("SINE");
+void parseSerialByte(uint8_t b, unsigned long currentMillis) {
+    switch (rxState) {
+        case RxState::Idle:
+            if (b == CMD_TARGET_RX || b == CMD_TARGET_TX) {
+                commandTarget = b;
+                rxState = RxState::CommandCode;
+            } else if (b == TX_SYNC_0) {
+                rxState = RxState::Sync;
+            }
             break;
 
-        case TRIANGLE:
-            Serial.println("TRIANGLE");
+        case RxState::CommandCode:
+            handleFilterCommand(commandTarget, b);
+            rxState = RxState::Idle;
             break;
 
-        case SQUARE:
-            Serial.println("SQUARE");
+        case RxState::Sync:
+            rxState = (b == TX_SYNC_1) ? RxState::LengthLo : RxState::Idle;
             break;
+
+        case RxState::LengthLo:
+            samplesRemaining = b;
+            rxState = RxState::LengthHi;
+            break;
+
+        case RxState::LengthHi:
+            samplesRemaining |= (uint16_t)b << 8;
+            if (samplesRemaining == 0 || samplesRemaining > TX_MAX_PACKET_SAMPLES) {
+                rxState = RxState::Idle;
+                break;
+            }
+            if (!isCurrentlyTxMode) {
+                setMode(true);
+            }
+            lastTxDataTime = currentMillis;
+            rxState = RxState::SampleLo;
+            break;
+
+        case RxState::SampleLo:
+            sampleLo = b;
+            rxState = RxState::SampleHi;
+            break;
+
+        case RxState::SampleHi: {
+            uint16_t dacSample = (((uint16_t)b << 8) | sampleLo) & 0x0FFF;
+            pushDacSample(dacSample);
+            rxState = (--samplesRemaining == 0) ? RxState::Idle : RxState::SampleLo;
+            break;
+        }
+    }
+}
+
+void serviceDac() {
+    uint32_t nowMicros = micros();
+
+    if (!dacPlaying) {
+        if (dacHead - dacTail < DAC_PREFILL_SAMPLES) return;
+        dacPlaying = true;
+        lastDacMicros = nowMicros;
     }
 
-    Serial.print("Output frequency: ");
-    Serial.print(OUTPUT_FREQUENCY);
-    Serial.println(" Hz");
+    if (nowMicros - lastDacMicros >= DAC_INTERVAL_MICROS) {
+        if (dacHead == dacTail) {
+            dacPlaying = false;
+            dacWrite(2048); // Drive 1.65V mid-scale silence on buffer underrun
+            return;
+        }
+        dacWrite(dacBuffer[dacTail++ & (DAC_BUFFER_SIZE - 1)]);
+        lastDacMicros += DAC_INTERVAL_MICROS;
+    }
+}
 
-    Serial.print("Sample rate: ");
-    Serial.print(SAMPLE_RATE);
-    Serial.println(" samples/sec");
+void checkBatteryStatus(unsigned long currentMillis) {
+    if (currentMillis - lastBatteryCheckMs >= 50) {
+        lastBatteryCheckMs = currentMillis;
 
-    Serial.print("Phase increment: ");
-    Serial.println(phaseIncrement);
+        if (digitalRead(PIN_BATTERY_SENSE) == LOW) {
+            highCounter = 0;
+            if (lowCounter < STABILITY_THRESHOLD) lowCounter++;
+        } else {
+            lowCounter = 0;
+            if (highCounter < STABILITY_THRESHOLD) highCounter++;
+        }
 
-    // ===============================
-    // Initialize DAC
-    // ===============================
+        if (lowCounter >= STABILITY_THRESHOLD && !debouncedLowState) {
+            debouncedLowState = true;
+            sendBatteryStatusFrame(0x01);
+        } else if (highCounter >= STABILITY_THRESHOLD && debouncedLowState) {
+            debouncedLowState = false;
+            sendBatteryStatusFrame(0x00);
+        }
+    }
+}
 
-    Serial.println("Initializing DAC...");
+void setup() {
+    Serial.begin(921600);
 
+    // USB CDC attachment wait loop for ESP32-S3 startup
+    unsigned long start = millis();
+    while (!Serial && (millis() - start < 3000)) {
+        delay(10);
+    }
+
+    pinMode(SWITCH_PIN, OUTPUT);
+    pinMode(ONBOARD_LED_PIN, OUTPUT);
+
+#if CONFIG_IDF_TARGET_ESP32S3
+    // Release GPIO 41/42 from internal JTAG subsystem (ESP32-S3 only)
+    gpio_reset_pin((gpio_num_t)PIN_ADC_SCK);
+    gpio_reset_pin((gpio_num_t)PIN_ADC_MISO);
+#endif
+
+    // Chip Select Pins
+    pinMode(PIN_CS_ADC, OUTPUT);
+    digitalWrite(PIN_CS_ADC, HIGH);
+
+    pinMode(PIN_CS_DAC, OUTPUT);
+    digitalWrite(PIN_CS_DAC, HIGH);
+
+    // Power Monitoring Input
+    pinMode(PIN_BATTERY_SENSE, INPUT_PULLUP);
+
+    // Hardware SPI Initialization
+    spiADC.begin(PIN_ADC_SCK, PIN_ADC_MISO, PIN_ADC_MOSI, PIN_CS_ADC);
+#if !CONFIG_IDF_TARGET_ESP32H2
+    spiDAC.begin(PIN_DAC_SCK, -1, PIN_DAC_MOSI, PIN_CS_DAC);
+#endif
+
+    // Peripherals and MUX Initialization
     dacBegin();
+    muxInit();
 
-    Serial.println("DAC initialized.");
+    // Default system state: RX Mode (Green LED, RAW_RX ADC Channel)
+    setMode(false);
 
-    // Start continuous SPI transaction
-    dacBeginContinuous();
-
-    Serial.println("DAC waveform generation started.");
-    */
+    // Initial Telemetry Broadcast
+    debouncedLowState = (digitalRead(PIN_BATTERY_SENSE) == LOW);
+    sendBatteryStatusFrame(debouncedLowState ? 0x01 : 0x00);
 }
 
-// ===============================
-// Main loop
-// ===============================
+void loop() {
+    static uint8_t usbBatchBuf[256];
+    static uint16_t usbBatchOffset = 0;
+    static int64_t streamStartUs = esp_timer_get_time();
+    static uint64_t sampleIndex = 0;
+    static uint8_t housekeepingDivider = 0;
 
-uint32_t generatedSamples = 0;
-uint32_t lastMeasurement = 0;
+    // 1. Housekeeping & Incoming Serial Parsing (every ~1 ms in RX, every pass in TX)
+    if (housekeepingDivider == 0) {
+        unsigned long currentMillis = millis();
+        checkBatteryStatus(currentMillis);
 
-void loop()
-{
-    uint16_t rawVal = adcRead(0);
-    unsigned long now = micros();
-
-    // Rising edge crossing detection with hysteresis
-    if (!isHigh && rawVal > THRESHOLD_HIGH)
-    {
-        isHigh = true;
-        if (lastCrossingMicros > 0)
-        {
-            unsigned long periodMicros = now - lastCrossingMicros;
-            if (periodMicros > 0)
-            {
-                currentFrequencyHz = 1000000.0f / static_cast<float>(periodMicros);
-            }
+        for (int i = 0; i < SERIAL_BYTES_PER_LOOP && Serial.available() > 0; i++) {
+            parseSerialByte((uint8_t)Serial.read(), currentMillis);
         }
-        lastCrossingMicros = now;
+
+        if (isCurrentlyTxMode && (currentMillis - lastTxDataTime >= TX_TIMEOUT_MS)) {
+            setMode(false);
+            resetDacPlayback();
+        }
     }
-    else if (isHigh && rawVal < THRESHOLD_LOW)
-    {
-        isHigh = false;
+
+    // 2. TX Mode: Stream PC Audio Packets to DAC
+    if (isCurrentlyTxMode) {
+        serviceDac();
+        housekeepingDivider = 0;
+        return;
     }
 
-    // Teleplot output updated every 50 ms (20 Hz plot refresh rate)
-    static unsigned long lastTeleplotPrint = 0;
-    if (millis() - lastTeleplotPrint >= 50)
-    {
-        Serial.printf(">Frequency_Hz:%.1f\n", currentFrequencyHz);
-        Serial.printf(">RawADC:%d\n", rawVal);
-        lastTeleplotPrint = millis();
+    // 3. RX Mode: Sample ADC at 48 kHz and Stream to PC
+    int64_t nowUs = esp_timer_get_time();
+    int64_t targetUs = streamStartUs + (int64_t)((sampleIndex * 1000000ULL) / 48000ULL);
+
+    if (nowUs >= targetUs) {
+        if (nowUs - targetUs > 100) {
+            streamStartUs = nowUs;
+            sampleIndex = 0;
+        }
+        sampleIndex++;
+        if (++housekeepingDivider >= 48) housekeepingDivider = 0;
+
+        uint16_t adcVal = adcReadFast(rxFilterChannel);
+
+        usbBatchBuf[usbBatchOffset++] = 0xAA;
+        usbBatchBuf[usbBatchOffset++] = 0xBB;
+        usbBatchBuf[usbBatchOffset++] = (uint8_t)(adcVal & 0xFF);
+        usbBatchBuf[usbBatchOffset++] = (uint8_t)((adcVal >> 8) & 0x0F);
+
+        if (usbBatchOffset >= sizeof(usbBatchBuf)) {
+            Serial.write(usbBatchBuf, sizeof(usbBatchBuf));
+            usbBatchOffset = 0;
+        }
     }
-    // Use upper 8 bits of phase
-    // to select one of 256 table entries
-    /*
-    uint8_t tableIndex =
-        phase >> 24;
-
-    // Send waveform sample to DAC
-
-    dacWriteContinuous(
-        waveformTable[tableIndex]
-    );
-
-    // Advance DDS phase
-
-    phase += phaseIncrement;
-
-    // Count generated samples
-
-    generatedSamples++;
-
-    // ===============================
-    // Sample-rate measurement
-    // ===============================
-
-    uint32_t now = millis();
-
-    if (now - lastMeasurement >= 1000)
-    {
-        Serial.print("Samples/sec: ");
-        Serial.println(generatedSamples);
-
-        generatedSamples = 0;
-        lastMeasurement = now;
-    }
-    */
 }
