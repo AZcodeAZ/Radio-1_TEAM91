@@ -6,7 +6,7 @@
 extern SPIClass spiADC;
 
 // 2 MHz clock: 24-bit MCP3204/3208 frame completes in 12 us
-static SPISettings adcSPI(2500000, MSBFIRST, SPI_MODE0);
+static SPISettings adcSPI(2000000, MSBFIRST, SPI_MODE0);
 static bool adcBusLocked = false;
 
 uint16_t adcReadFast(uint8_t channel) {
